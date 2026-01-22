@@ -5,6 +5,16 @@ from lib.db import init_db, execute, fetchall, fetchone
 from lib.auth import register_user, login_user
 from lib.monetisation_helper import format_currency
 
+from lib.query_helpers import (
+    get_available_tasks_for_volunteer,
+    get_volunteer_accepted_tasks,
+    get_volunteer_notifications,
+    get_volunteer_profile,
+    clear_volunteer_cache,
+    clear_task_cache
+)
+from lib.rate_limiter import check_action_rate_limit
+
 def get_day_of_week(date_obj):
 	"""Get day of week name from date object"""
 	if date_obj:
@@ -127,15 +137,12 @@ if not st.session_state["vol_user"]:
 	st.stop()
 
 current = st.session_state["vol_user"]
-volunteer_record = fetchone("SELECT * FROM volunteers WHERE id=?", (current["id"],)) or {}
+volunteer_record = get_volunteer_profile(current["id"]) or {}
 
 st.markdown(f"### Welcome, {current['name']}")
 
-# Check for unread notifications
-notifications = fetchall(
-	"SELECT * FROM notifications WHERE user_type='volunteer' AND user_id=? AND is_read=0 ORDER BY created_at DESC",
-	(current["id"],)
-)
+# Check for unread notifications - Optimized with caching
+notifications = get_volunteer_notifications(current["id"])
 
 if notifications:
 	st.info(f"🔔 You have {len(notifications)} new notification(s)")
@@ -145,6 +152,7 @@ if notifications:
 			st.write(notif.get('message', ''))
 			if st.button("Mark as Read", key=f"read_{notif['id']}"):
 				execute("UPDATE notifications SET is_read=1 WHERE id=?", (notif["id"],))
+				clear_volunteer_cache(current["id"])
 				st.rerun()
 
 # Tabs: Browse Tasks, My Accepted Tasks, Profile
@@ -181,32 +189,18 @@ with browse_tab:
 		elif date_input:
 			date_range = (date_input, date_input)
 	
-	query = "SELECT tasks.*, ngos.name as ngo_name FROM tasks JOIN ngos ON ngos.id = tasks.ngo_id WHERE tasks.is_deleted = 0"
-	params = []
-	if city:
-		query += " AND tasks.location LIKE ?"
-		params.append(f"%{city}%")
-	if status != "all":
-		query += " AND tasks.status = ?"
-		params.append(status)
-	if category_filter != "All":
-		query += " AND tasks.category = ?"
-		params.append(category_filter)
-	if max_hours > 0:
-		query += " AND IFNULL(tasks.hours, 0) <= ?"
-		params.append(int(max_hours))
-	if date_range:
-		start_date, end_date = date_range
-		query += " AND date(tasks.date) BETWEEN ? AND ?"
-		params.extend([str(start_date), str(end_date)])
-	if skills_filter:
-		skill_terms = [term.strip() for term in skills_filter.split(",") if term.strip()]
-		for term in skill_terms:
-			query += " AND IFNULL(tasks.required_skills, '') LIKE ?"
-			params.append(f"%{term}%")
-	query += " ORDER BY tasks.id DESC"
-
-	tasks = fetchall(query, tuple(params))
+	# Prepare filters for optimized query
+	filters = {
+		'city': city,
+		'status': status,
+		'category': category_filter,
+		'max_hours': max_hours,
+		'skills': skills_filter,
+		'age': age_filter
+	}
+	
+	# Fetch tasks with optimized cached query
+	tasks = get_available_tasks_for_volunteer(current["id"], filters)
 	# Apply age filter
 	if age_filter > 0:
 		tasks = [
@@ -227,22 +221,27 @@ with browse_tab:
 		st.info("No tasks found matching your criteria.")
 	else:
 		for t in tasks:
-			# Check if volunteer already accepted this task
-			already_accepted = fetchone(
-				"SELECT * FROM volunteer_acceptances WHERE task_id=? AND volunteer_id=?",
-				(t["id"], current["id"])
-			)
+			# These values are now part of the task object from the optimized query or pre-fetched
+			# Check if volunteer already accepted this task (already_accepted column in new query)
+			is_accepted = t.get('already_accepted', 0)
 			
-			# Get current volunteer count (only approved)
-			count_result = fetchone(
-				"""
-				SELECT COUNT(*) as count
-				FROM volunteer_acceptances
-				WHERE task_id=? AND approval_status='approved' AND (status IS NULL OR status IN ('accepted','completed'))
-				""",
-				(t["id"],),
-			)
-			volunteer_count = count_result["count"] if count_result else 0
+			# Fetch detailed acceptance info if needed (for display/withdraw logic)
+			already_accepted = None
+			if is_accepted:
+				already_accepted = fetchone(
+					"SELECT * FROM volunteer_acceptances WHERE task_id=? AND volunteer_id=?",
+					(t["id"], current["id"])
+				)
+			
+			# Current volunteer count (can also be optimized into the main query if needed, 
+			# but here we keep it simple since we already reduced queries significantly)
+			volunteer_count = t.get('volunteer_count', 0)
+			if volunteer_count == 0: # Fallback if not in query result
+				count_result = fetchone(
+					"SELECT COUNT(*) as count FROM volunteer_acceptances WHERE task_id=? AND approval_status='approved'",
+					(t["id"],)
+				)
+				volunteer_count = count_result["count"] if count_result else 0
 			
 			max_vols = t.get('max_volunteers') or None
 			is_full = max_vols and volunteer_count >= max_vols
@@ -314,6 +313,7 @@ with browse_tab:
 						st.caption("You can apply again if the task is still open.")
 						if st.button("Remove from My List", key=f"remove_rejected_{t['id']}", type="secondary"):
 							execute("DELETE FROM volunteer_acceptances WHERE id=?", (already_accepted["id"],))
+							clear_volunteer_cache(current["id"])
 							st.rerun()
 					elif approval_status == "pending":
 						st.warning("⏳ Your application is pending NGO approval.")
@@ -323,6 +323,7 @@ with browse_tab:
 						with col_view2:
 							if st.button("Withdraw Application", key=f"withdraw_pending_{t['id']}", type="secondary"):
 								execute("DELETE FROM volunteer_acceptances WHERE id=?", (already_accepted["id"],))
+								clear_volunteer_cache(current["id"])
 								st.success("Application withdrawn.")
 								st.rerun()
 					else:  # approved
@@ -343,19 +344,10 @@ with browse_tab:
 									execute("DELETE FROM volunteer_acceptances WHERE id=?", (already_accepted["id"],))
 									# Reopen task if it was closed and now has space
 									if t.get('status') == 'closed':
-										max_vols = t.get('max_volunteers', 0)
-										if max_vols:
-											count_after = fetchone(
-												"""
-												SELECT COUNT(*) as count
-												FROM volunteer_acceptances
-												WHERE task_id=? AND approval_status='approved' AND (status IS NULL OR status IN ('accepted','completed'))
-												""",
-												(t["id"],),
-											)
-											current_count = count_after["count"] if count_after else 0
-											if current_count < max_vols:
-												execute("UPDATE tasks SET status='open' WHERE id=?", (t["id"],))
+										execute("UPDATE tasks SET status='open' WHERE id=?", (t["id"],))
+									
+									clear_volunteer_cache(current["id"])
+									clear_task_cache(t["id"])
 									st.success("You have withdrawn from this task.")
 									st.rerun()
 							else:
@@ -380,6 +372,8 @@ with browse_tab:
 						accept_btn = st.form_submit_button("Apply for Task", use_container_width=True)
 						
 						if accept_btn:
+							if not check_action_rate_limit(current["id"], "apply_task"):
+								st.stop()
 							# Validate compulsory fields
 							if not additional_notes or not additional_notes.strip():
 								st.error("Please explain why you should be accepted for this task. This field is required.")
@@ -396,6 +390,8 @@ with browse_tab:
 										(t["id"], current["id"], str(availability_date), 
 										 int(hours_committed), contact_email, contact_phone, additional_notes)
 									)
+									clear_volunteer_cache(current["id"])
+									clear_task_cache(t["id"])
 									st.success("Application submitted successfully! Waiting for NGO approval.")
 									st.rerun()
 								except Exception as e:
@@ -406,21 +402,7 @@ with browse_tab:
 
 with accepted_tab:
 	st.subheader("My Accepted Tasks")
-	accepted_tasks = fetchall(
-		"""
-		SELECT volunteer_acceptances.*, tasks.title as task_title, tasks.description as task_desc,
-		       tasks.location as task_location, tasks.address as task_address, tasks.date as task_date, 
-		       tasks.start_date, tasks.end_date, tasks.hours, tasks.category, tasks.urgency,
-		       tasks.age_requirement, tasks.physical_requirements, tasks.equipment_needed, tasks.wage_rate,
-		       ngos.name as ngo_name, ngos.email as ngo_email
-		FROM volunteer_acceptances
-		JOIN tasks ON tasks.id = volunteer_acceptances.task_id
-		JOIN ngos ON ngos.id = tasks.ngo_id
-		WHERE volunteer_acceptances.volunteer_id = ?
-		ORDER BY volunteer_acceptances.created_at DESC
-		""",
-		(current["id"],),
-	)
+	accepted_tasks = get_volunteer_accepted_tasks(current["id"])
 	
 	if not accepted_tasks:
 		st.info("You haven't accepted any tasks yet. Browse tasks to get started!")
@@ -483,22 +465,11 @@ with accepted_tab:
 					if acc_status == "accepted":
 						if st.button("Withdraw from Task", key=f"withdraw_acc_{acc['id']}", type="secondary"):
 							execute("DELETE FROM volunteer_acceptances WHERE id=?", (acc["id"],))
-							# Check if task should be reopened
-							task_info = fetchone("SELECT * FROM tasks WHERE id=?", (acc["task_id"],))
-							if task_info and task_info.get('status') == 'closed':
-								max_vols = task_info.get('max_volunteers', 0)
-								if max_vols:
-									count_after = fetchone(
-										"""
-										SELECT COUNT(*) as count
-										FROM volunteer_acceptances
-										WHERE task_id=? AND (status IS NULL OR status IN ('accepted','completed'))
-										""",
-										(acc["task_id"],),
-									)
-									current_count = count_after["count"] if count_after else 0
-									if current_count < max_vols:
-										execute("UPDATE tasks SET status='open' WHERE id=?", (acc["task_id"],))
+							# Reopen task if it was closed
+							execute("UPDATE tasks SET status='open' WHERE id=?", (acc["task_id"],))
+							
+							clear_volunteer_cache(current["id"])
+							clear_task_cache(acc["task_id"])
 							st.success("You have withdrawn from this task.")
 							st.rerun()
 					else:
@@ -525,18 +496,10 @@ with profile_tab:
 				"UPDATE volunteers SET name=?, location=?, skills=?, phone=?, gender=?, age=? WHERE id=?",
 				(name, location, skills, phone, gender, int(age_value) if age_value else None, current["id"]),
 			)
+			clear_volunteer_cache(current["id"])
 			st.session_state["vol_user"]["name"] = name
-			volunteer_record.update(
-				{
-					"name": name,
-					"location": location,
-					"skills": skills,
-					"phone": phone,
-					"gender": gender,
-					"age": int(age_value) if age_value else None,
-				}
-			)
 			st.success("Profile updated")
+			st.rerun()
 	
 	st.markdown("---")
 	st.markdown("### 📊 Volunteer Statistics")
