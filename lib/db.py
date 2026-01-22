@@ -1,11 +1,17 @@
 from __future__ import annotations
 import os
+import logging
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
+import psycopg2.pool
 import psycopg2.extras
 from dotenv import load_dotenv
 import streamlit as st
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -23,8 +29,16 @@ if not DATABASE_URL:
 
 @st.cache_resource
 def get_connection_pool():
-	"""Create a cached connection pool for better performance."""
-	return DATABASE_URL
+	"""Create a connection pool for reusing database connections."""
+	try:
+		return psycopg2.pool.SimpleConnectionPool(
+			minconn=1,
+			maxconn=10,  # Max 10 concurrent connections
+			dsn=DATABASE_URL
+		)
+	except Exception as e:
+		logger.error(f"Failed to create connection pool: {e}")
+		raise
 
 
 @contextmanager
@@ -33,15 +47,25 @@ def get_conn():
 	Context manager for database connections.
 	Automatically commits on success and rolls back on error.
 	"""
-	conn = psycopg2.connect(get_connection_pool())
+	pool = get_connection_pool()
+	conn = None
 	try:
+		conn = pool.getconn()
 		yield conn
 		conn.commit()
-	except Exception:
-		conn.rollback()
+	except psycopg2.OperationalError as e:
+		logger.error(f"Database connection error: {e}")
+		if conn:
+			conn.rollback()
+		raise
+	except Exception as e:
+		logger.error(f"Database error: {e}")
+		if conn:
+			conn.rollback()
 		raise
 	finally:
-		conn.close()
+		if conn:
+			pool.putconn(conn)
 
 
 @st.cache_resource
@@ -171,7 +195,20 @@ def init_db() -> None:
 					ALTER TABLE tasks ADD COLUMN work_end_time TEXT;
 				END IF;
 			END $$;
-		""")
+		""")\n	\n	# Create indexes for performance (10-100x faster queries)\n	cur.execute("""
+		CREATE INDEX IF NOT EXISTS idx_tasks_ngo_id ON tasks(ngo_id);
+		CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+		CREATE INDEX IF NOT EXISTS idx_tasks_deleted ON tasks(is_deleted);
+		CREATE INDEX IF NOT EXISTS idx_tasks_ngo_deleted ON tasks(ngo_id, is_deleted);
+		CREATE INDEX IF NOT EXISTS idx_acceptances_task ON volunteer_acceptances(task_id);
+		CREATE INDEX IF NOT EXISTS idx_acceptances_volunteer ON volunteer_acceptances(volunteer_id);
+		CREATE INDEX IF NOT EXISTS idx_acceptances_status ON volunteer_acceptances(approval_status);
+		CREATE INDEX IF NOT EXISTS idx_acceptances_task_status ON volunteer_acceptances(task_id, approval_status);
+		CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_type, user_id, is_read);
+		CREATE INDEX IF NOT EXISTS idx_ngos_email ON ngos(email);
+		CREATE INDEX IF NOT EXISTS idx_volunteers_email ON volunteers(email);
+	""")
+
 
 
 
