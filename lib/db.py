@@ -195,7 +195,10 @@ def init_db() -> None:
 					ALTER TABLE tasks ADD COLUMN work_end_time TEXT;
 				END IF;
 			END $$;
-		""")\n	\n	# Create indexes for performance (10-100x faster queries)\n	cur.execute("""
+		""")
+	
+	# Create indexes for performance (10-100x faster queries)
+	cur.execute("""
 		CREATE INDEX IF NOT EXISTS idx_tasks_ngo_id ON tasks(ngo_id);
 		CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 		CREATE INDEX IF NOT EXISTS idx_tasks_deleted ON tasks(is_deleted);
