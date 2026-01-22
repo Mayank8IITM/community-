@@ -239,8 +239,8 @@ def get_volunteer_profile(volunteer_id: int) -> Optional[Dict[str, Any]]:
 def clear_ngo_cache(ngo_id: int):
 	"""Clear all cached data for an NGO when data changes."""
 	get_tasks_with_counts.clear()
-	get_all_ngo_volunteers.clear()
 	get_analytics_data.clear()
+	get_all_ngo_volunteers.clear()
 	get_ngo_profile.clear()
 
 
@@ -250,6 +250,7 @@ def clear_volunteer_cache(volunteer_id: int):
 	get_volunteer_accepted_tasks.clear()
 	get_volunteer_notifications.clear()
 	get_volunteer_profile.clear()
+	get_analytics_data.clear()
 
 
 def clear_task_cache(task_id: int):
@@ -257,3 +258,4 @@ def clear_task_cache(task_id: int):
 	get_task_volunteers.clear()
 	get_tasks_with_counts.clear()
 	get_available_tasks_for_volunteer.clear()
+	get_analytics_data.clear()
