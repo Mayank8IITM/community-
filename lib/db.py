@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
+import streamlit as st
 
 # Load environment variables
 load_dotenv()
@@ -20,13 +21,19 @@ if not DATABASE_URL:
 	)
 
 
+@st.cache_resource
+def get_connection_pool():
+	"""Create a cached connection pool for better performance."""
+	return DATABASE_URL
+
+
 @contextmanager
 def get_conn():
 	"""
 	Context manager for database connections.
 	Automatically commits on success and rolls back on error.
 	"""
-	conn = psycopg2.connect(DATABASE_URL)
+	conn = psycopg2.connect(get_connection_pool())
 	try:
 		yield conn
 		conn.commit()
@@ -37,6 +44,7 @@ def get_conn():
 		conn.close()
 
 
+@st.cache_resource
 def init_db() -> None:
 	"""Initialize database tables with PostgreSQL-compatible schema."""
 	with get_conn() as conn:
