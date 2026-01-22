@@ -18,6 +18,17 @@ from lib.monetisation_helper import (
 from lib.file_validation import validate_file_size, format_file_size
 from dotenv import load_dotenv
 
+from lib.query_helpers import (
+    get_tasks_with_counts, 
+    get_task_volunteers, 
+    get_all_ngo_volunteers, 
+    get_analytics_data, 
+    get_ngo_profile,
+    clear_ngo_cache,
+    clear_task_cache
+)
+from lib.rate_limiter import check_action_rate_limit
+
 # Load environment variables
 load_dotenv()
 
@@ -174,8 +185,8 @@ if not st.session_state["ngo_user"]:
 
 current = st.session_state["ngo_user"]
 
-# Fetch NGO data for use throughout the dashboard
-ngo_data = fetchone("SELECT * FROM ngos WHERE id=?", (current["id"],))
+# Fetch NGO data for use throughout the dashboard - Optimized with caching
+ngo_data = get_ngo_profile(current["id"])
 
 st.markdown(f"### Welcome, {current['name']}")
 
@@ -183,7 +194,7 @@ st.markdown(f"### Welcome, {current['name']}")
 profile_tab, tasks_tab, volunteers_tab, analytics_tab = st.tabs(["Profile", "Tasks", "Volunteers", "Analytics"])
 
 with profile_tab:
-	ngo = fetchone("SELECT * FROM ngos WHERE id=?", (current["id"],))
+	ngo = get_ngo_profile(current["id"])
 	with st.form("ngo_profile"):
 		name = st.text_input("Organization Name", value=ngo.get("name", ""))
 		email = st.text_input("Email", value=ngo.get("email", ""), disabled=True)
@@ -265,6 +276,7 @@ with profile_tab:
 						current["id"],
 					),
 				)
+				clear_ngo_cache(current["id"])
 				st.success("Profile updated")
 				st.rerun()
 			except Exception as e:
@@ -379,6 +391,8 @@ with tasks_tab:
 					st.warning("Fill Title/Desc/Loc first.")
 		
 		if st.button("Create Task", use_container_width=True, type="primary"):
+			if not check_action_rate_limit(current["id"], "create_task"):
+				st.stop()
 			required = [title, desc, loc, address, contact_email, contact_phone, category, urgency]
 			if not all(required):
 				st.error("Missing required fields (*) including Work Address")
@@ -405,6 +419,7 @@ with tasks_tab:
 						 deadline_str, urgency, age_requirement, physical_requirements, equipment_needed, wage_rate,
 						 str(work_start_time), str(work_end_time)),
 					)
+					clear_ngo_cache(current["id"])
 					st.success("Task created!")
 					# Reset form - increment counter to force new form
 					st.session_state.task_form_counter += 1
@@ -426,21 +441,14 @@ with tasks_tab:
 					st.error(f"Error: {e}")
 	with right:
 		st.subheader("Your Tasks")
-		tasks = fetchall("SELECT * FROM tasks WHERE ngo_id=? AND is_deleted=0 ORDER BY id DESC", (current["id"],))
+		# Using optimized query with cached counts
+		tasks = get_tasks_with_counts(current["id"])
 		if not tasks:
 			st.info("No tasks created yet. Create your first task using the form on the left.")
 		else:
 			for t in tasks:
-				# Get volunteer count (only approved)
-				count_result = fetchone(
-					"""
-					SELECT COUNT(*) as count
-					FROM volunteer_acceptances
-					WHERE task_id=? AND approval_status='approved' AND (status IS NULL OR status IN ('accepted','completed'))
-					""",
-					(t["id"],),
-				)
-				volunteer_count = count_result["count"] if count_result else 0
+				# Use pre-fetched volunteer count from optimized query
+				volunteer_count = t.get("volunteer_count", 0)
 				max_vols = t.get('max_volunteers', 0)
 				
 				# Auto-close task if max volunteers reached
@@ -504,6 +512,7 @@ with tasks_tab:
 					with col2:
 						if st.button("Mark Closed", key=f"close_{t['id']}"):
 							execute("UPDATE tasks SET status='closed' WHERE id=?", (t["id"],))
+							clear_task_cache(t["id"])
 							st.rerun()
 					with col3:
 						if st.button("Edit", key=f"edit_{t['id']}"):
@@ -545,6 +554,7 @@ with tasks_tab:
 										execute("UPDATE tasks SET is_deleted=1 WHERE id=?", (t["id"],))
 										# We don't delete acceptances so they stay in analytics
 										
+										clear_task_cache(t["id"])
 										del st.session_state["confirm_delete_task_id"]
 										st.success(f"Task deleted. {len(affected_volunteers)} volunteer(s) notified.")
 										st.rerun()
@@ -553,28 +563,10 @@ with tasks_tab:
 									del st.session_state["confirm_delete_task_id"]
 									st.rerun()
 					
-					# Show approved and pending volunteers for this task
-					approved_vols = fetchall(
-						"""
-						SELECT volunteer_acceptances.*, volunteers.name as vol_name, volunteers.email as vol_email, volunteers.location as vol_location
-						FROM volunteer_acceptances
-						JOIN volunteers ON volunteers.id = volunteer_acceptances.volunteer_id
-						WHERE volunteer_acceptances.task_id = ? AND volunteer_acceptances.approval_status = 'approved'
-						ORDER BY volunteer_acceptances.created_at DESC
-						""",
-						(t["id"],),
-					)
-					
-					pending_vols = fetchall(
-						"""
-						SELECT volunteer_acceptances.*, volunteers.name as vol_name, volunteers.email as vol_email, volunteers.location as vol_location
-						FROM volunteer_acceptances
-						JOIN volunteers ON volunteers.id = volunteer_acceptances.volunteer_id
-						WHERE volunteer_acceptances.task_id = ? AND volunteer_acceptances.approval_status = 'pending'
-						ORDER BY volunteer_acceptances.created_at DESC
-						""",
-						(t["id"],),
-					)
+					# Show approved and pending volunteers for this task - Optimized with caching
+					vols_data = get_task_volunteers(t["id"])
+					approved_vols = vols_data['approved']
+					pending_vols = vols_data['pending']
 					
 					if pending_vols:
 						st.markdown("---")
@@ -593,17 +585,20 @@ with tasks_tab:
 										st.caption(f"📝 Notes: {vol.get('additional_notes')}")
 								with vol_col2:
 									if st.button("✅ Approve", key=f"approve_{vol['id']}", type="primary", use_container_width=True):
-										execute(
-											"UPDATE volunteer_acceptances SET approval_status='approved' WHERE id=?",
-											(vol["id"],),
-										)
-										st.success("Volunteer approved!")
-										st.rerun()
+										if st.session_state["ngo_user"] and check_action_rate_limit(st.session_state["ngo_user"]["id"], "approve_volunteer"):
+											execute(
+												"UPDATE volunteer_acceptances SET approval_status='approved' WHERE id=?",
+												(vol["id"],),
+											)
+											clear_task_cache(t["id"])
+											st.success("Volunteer approved!")
+											st.rerun()
 									if st.button("❌ Reject", key=f"reject_{vol['id']}", type="secondary", use_container_width=True):
 										execute(
 											"UPDATE volunteer_acceptances SET approval_status='rejected' WHERE id=?",
 											(vol["id"],),
 										)
+										clear_task_cache(t["id"])
 										st.warning("Application rejected")
 										st.rerun()
 								st.markdown("---")
@@ -658,6 +653,7 @@ with tasks_tab:
 												# Update volunteer's total value generated
 												update_volunteer_total_value(vol["volunteer_id"])
 												
+												clear_task_cache(t["id"])
 												st.success(f"Marked as completed! Value generated: {format_currency(monetisation_value)}")
 											else:
 												# No wage rate set, just mark as completed
@@ -665,12 +661,14 @@ with tasks_tab:
 													"UPDATE volunteer_acceptances SET status='completed', completion_note=NULL WHERE id=?",
 													(vol["id"],),
 												)
+												clear_task_cache(t["id"])
 												st.success("Marked as completed")
 										else:
 											execute(
 												"UPDATE volunteer_acceptances SET status='completed', completion_note=NULL WHERE id=?",
 												(vol["id"],),
 											)
+											clear_task_cache(t["id"])
 											st.success("Marked as completed")
 										st.rerun()
 									
@@ -693,6 +691,7 @@ with tasks_tab:
 												 f"Certificate has been sent to your Email/Phone Number : {t.get('title', 'N/A')}", 
 												 vol["id"])
 											)
+											clear_task_cache(t["id"])
 											st.success("Certificate notification sent!")
 											st.rerun()
 									
@@ -721,6 +720,7 @@ with tasks_tab:
 												)
 												# Update volunteer total (will exclude this task)
 												update_volunteer_total_value(vol["volunteer_id"])
+												clear_task_cache(t["id"])
 												st.warning("Marked as not completed")
 												st.rerun()
 											else:
@@ -850,6 +850,8 @@ with tasks_tab:
 
 						update_btn = st.form_submit_button("Update Task", use_container_width=True)
 						if update_btn:
+							if not check_action_rate_limit(current["id"], "edit_task"):
+								st.stop()
 							required_fields = [edit_title, edit_desc, edit_loc, edit_address, edit_contact_email, edit_contact_phone]
 							if not all(required_fields):
 								st.error("Please complete all required fields including Work Address and contact details.")
@@ -949,6 +951,7 @@ with tasks_tab:
 												 edit_task_id)
 											)
 									
+									clear_task_cache(edit_task_id)
 									st.success("Task updated successfully.")
 									st.session_state["editing_task_id"] = None
 									st.rerun()
@@ -983,6 +986,7 @@ with tasks_tab:
 						current_count = count_after["count"] if count_after else 0
 						if current_count < max_vols:
 							execute("UPDATE tasks SET status='open' WHERE id=?", (remove_context["task_id"],))
+				clear_task_cache(remove_context["task_id"])
 				st.session_state["remove_volunteer_context"] = None
 				st.rerun()
 			if cancel_col.button("No", key="confirm_remove_cancel"):
@@ -992,18 +996,8 @@ with tasks_tab:
 with volunteers_tab:
 	st.subheader("All Accepted Volunteers")
 	
-	all_volunteers = fetchall(
-		"""
-		SELECT volunteer_acceptances.*, tasks.title as task_title, tasks.category, tasks.date as task_date,
-		       volunteers.name as vol_name, volunteers.email as vol_email, volunteers.location as vol_location, volunteers.skills as vol_skills
-		FROM volunteer_acceptances
-		JOIN tasks ON tasks.id = volunteer_acceptances.task_id
-		JOIN volunteers ON volunteers.id = volunteer_acceptances.volunteer_id
-		WHERE tasks.ngo_id = ?
-		ORDER BY volunteer_acceptances.created_at DESC
-		""",
-		(current["id"],),
-	)
+	# Optimized query with caching
+	all_volunteers = get_all_ngo_volunteers(current["id"])
 	
 	if not all_volunteers:
 		st.info("No volunteers have accepted any tasks yet.")
@@ -1052,8 +1046,10 @@ with volunteers_tab:
 with analytics_tab:
 	st.subheader("📊 NGO Analytics & Statistics")
 	
-	# Get all tasks
-	all_tasks = fetchall("SELECT * FROM tasks WHERE ngo_id=?", (current["id"],))
+	# Optimized query with caching for analytics
+	analytics = get_analytics_data(current["id"])
+	all_tasks = analytics['tasks']
+	all_acceptances = analytics['acceptances']
 	
 	if not all_tasks:
 		st.info("No tasks created yet. Create tasks to see analytics!")
@@ -1061,31 +1057,13 @@ with analytics_tab:
 		import pandas as pd
 		from datetime import datetime
 		
-		# Calculate statistics
-		total_tasks = len(all_tasks)
-		open_tasks = len([t for t in all_tasks if t.get('status') == 'open'])
-		closed_tasks = len([t for t in all_tasks if t.get('status') == 'closed'])
-		
-		# Get all volunteer acceptances
-		all_acceptances = fetchall(
-			"""
-			SELECT volunteer_acceptances.*, tasks.title, tasks.category, tasks.date as task_date
-			FROM volunteer_acceptances
-			JOIN tasks ON tasks.id = volunteer_acceptances.task_id
-			WHERE tasks.ngo_id = ?
-			""",
-			(current["id"],),
-		)
-		
-		total_volunteers = len(all_acceptances)
-		total_hours_committed = sum(acc.get('hours_committed', 0) or 0 for acc in all_acceptances)
-		
-		# Calculate total value generated (only completed tasks)
-		completed_acceptances = [
-			acc for acc in all_acceptances 
-			if acc.get('status') == 'completed' and acc.get('approval_status') == 'approved'
-		]
-		total_value_generated = sum(acc.get('monetisation_value', 0) or 0 for acc in completed_acceptances)
+		# Use pre-calculated statistics
+		total_tasks = analytics['total_tasks']
+		open_tasks = analytics['open_tasks']
+		closed_tasks = analytics['closed_tasks']
+		total_volunteers = analytics['total_volunteers']
+		total_hours_committed = analytics['total_hours']
+		total_value_generated = analytics['total_value']
 		
 		# Display metrics with modern cards
 		st.markdown("<div class='spacer-24'></div>", unsafe_allow_html=True)
@@ -1138,7 +1116,7 @@ with analytics_tab:
 		
 		st.markdown("---")
 		
-		# Category breakdown
+		# Use local variables for breakdown calculations (already loaded from analytics)
 		category_data = {}
 		for task in all_tasks:
 			cat = task.get('category', 'Other')
