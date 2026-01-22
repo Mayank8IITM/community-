@@ -148,7 +148,14 @@ if notifications:
 	st.info(f"🔔 You have {len(notifications)} new notification(s)")
 	for notif in notifications:
 		notif_type = notif.get('notification_type', 'notification').replace('_', ' ').title()
-		with st.expander(f"📬 {notif_type} - {notif.get('created_at', '')[:16]}"):
+		# Safely format created_at timestamp
+		created_at = notif.get('created_at')
+		if hasattr(created_at, 'strftime'):
+			time_str = created_at.strftime("%Y-%m-%d %H:%M")
+		else:
+			time_str = str(created_at)[:16]
+		
+		with st.expander(f"📬 {notif_type} - {time_str}"):
 			st.write(notif.get('message', ''))
 			if st.button("Mark as Read", key=f"read_{notif['id']}"):
 				execute("UPDATE notifications SET is_read=1 WHERE id=?", (notif["id"],))
